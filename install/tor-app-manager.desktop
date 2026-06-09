@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Tor App Manager
+GenericName=Tor Proxy Manager
+Comment=Control transparent Tor proxy, switch countries, rotate IP
+Exec=/usr/local/bin/tor-app-manager-ui
+Icon=/usr/local/share/icons/tor-app-manager.png
+Terminal=false
+Type=Application
+Categories=Network;Security;System;
+StartupNotify=true
+X-GNOME-Autostart-enabled=true

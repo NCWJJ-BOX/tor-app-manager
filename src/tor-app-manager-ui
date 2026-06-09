@@ -1,0 +1,730 @@
+#!/usr/bin/env python3
+"""
+Tor App Manager — Full GUI for Transparent Tor Proxy
+Toggle • Country select • Rotate IP • Ping
+"""
+
+import sys
+import subprocess
+import json
+import threading
+import os
+import signal
+import re
+from functools import partial
+from datetime import datetime
+
+from PyQt5.QtWidgets import (
+    QApplication, QSystemTrayIcon, QMenu, QMessageBox, QDialog,
+    QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QWidget, QFrame,
+    QComboBox, QGridLayout, QGroupBox, QTabWidget, QTextEdit,
+    QMainWindow, QAction, QStatusBar, QProgressBar, QSlider,
+    QCheckBox, QSpinBox
+)
+from PyQt5.QtGui import (
+    QIcon, QFont, QColor, QPalette, QPainter, QPixmap, QCursor
+)
+from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QSize
+
+
+# ── Constants ────────────────────────────────────────────────────────────
+
+SCRIPT = "/usr/local/bin/tor-app-manager"
+TORRC = "/etc/tor/torrc"
+TOR_CONTROL_PORT = 9051
+TOR_COOKIE = "/run/tor/control.authcookie"
+
+# Country codes with names
+COUNTRIES = {
+    "": "🔀 Random (any)",
+    "us": "🇺🇸 United States", "gb": "🇬🇧 United Kingdom",
+    "de": "🇩🇪 Germany", "nl": "🇳🇱 Netherlands",
+    "fr": "🇫🇷 France", "ca": "🇨🇦 Canada",
+    "ch": "🇨🇭 Switzerland", "se": "🇸🇪 Sweden",
+    "no": "🇳🇴 Norway", "is": "🇮🇸 Iceland",
+    "ro": "🇷🇴 Romania", "pl": "🇵🇱 Poland",
+    "cz": "🇨🇿 Czech Republic", "at": "🇦🇹 Austria",
+    "be": "🇧🇪 Belgium", "dk": "🇩🇰 Denmark",
+    "fi": "🇫🇮 Finland", "ie": "🇮🇪 Ireland",
+    "lu": "🇱🇺 Luxembourg", "it": "🇮🇹 Italy",
+    "es": "🇪🇸 Spain", "pt": "🇵🇹 Portugal",
+    "jp": "🇯🇵 Japan", "sg": "🇸🇬 Singapore",
+    "kr": "🇰🇷 South Korea", "tw": "🇹🇼 Taiwan",
+    "au": "🇦🇺 Australia", "nz": "🇳🇿 New Zealand",
+    "br": "🇧🇷 Brazil", "ar": "🇦🇷 Argentina",
+    "mx": "🇲🇽 Mexico", "za": "🇿🇦 South Africa",
+    "in": "🇮🇳 India", "th": "🇹🇭 Thailand",
+    "vn": "🇻🇳 Vietnam", "my": "🇲🇾 Malaysia",
+    "ph": "🇵🇭 Philippines", "id": "🇮🇩 Indonesia",
+    "ru": "🇷🇺 Russia", "ua": "🇺🇦 Ukraine",
+    "tr": "🇹🇷 Turkey", "ae": "🇦🇪 UAE",
+    "il": "🇮🇱 Israel", "hk": "🇭🇰 Hong Kong",
+}
+
+
+# ── Backend Calls ────────────────────────────────────────────────────────
+
+def run_script(*args):
+    try:
+        r = subprocess.run(
+            ["sudo", SCRIPT] + list(args),
+            capture_output=True, text=True, timeout=30
+        )
+        return r.returncode, r.stdout, r.stderr
+    except Exception as e:
+        return -1, "", str(e)
+
+
+def get_tor_status():
+    tor = False
+    proxy = False
+    try:
+        r = subprocess.run(["systemctl", "is-active", "tor"],
+                           capture_output=True, text=True, timeout=5)
+        tor = r.stdout.strip() == "active"
+    except: pass
+
+    try:
+        r = subprocess.run(["sudo", "iptables", "-t", "nat", "-L", "OUTPUT", "-n"],
+                           capture_output=True, text=True, timeout=5)
+        proxy = "REDIRECT" in r.stdout
+    except: pass
+
+    return tor, proxy
+
+
+def get_public_ips():
+    """Returns (direct_ip, tor_exit_ip, is_tor, tor_country) — PARALLEL"""
+    result = {"direct": "?", "tor": "?", "is_tor": False, "country": "?"}
+    results = {}
+
+    def _fetch_direct():
+        try:
+            r = subprocess.run(
+                ["curl", "-4", "--connect-timeout", "3", "-s", "https://ifconfig.me"],
+                capture_output=True, text=True, timeout=6
+            )
+            if r.stdout.strip():
+                results["direct"] = r.stdout.strip()
+        except: pass
+
+    def _fetch_tor():
+        try:
+            r = subprocess.run(
+                ["curl", "-4", "--connect-timeout", "3", "-s",
+                 "--socks5-hostname", "127.0.0.1:9050",
+                 "https://ipinfo.io/json"],
+                capture_output=True, text=True, timeout=8
+            )
+            if r.stdout.strip():
+                data = json.loads(r.stdout)
+                results["tor"] = data.get("ip", "?")
+                results["country"] = data.get("country", "?")
+                results["is_tor"] = True
+        except: pass
+
+    t1 = threading.Thread(target=_fetch_direct, daemon=True)
+    t2 = threading.Thread(target=_fetch_tor, daemon=True)
+    t1.start()
+    t2.start()
+    t1.join(timeout=7)
+    t2.join(timeout=9)
+
+    if "direct" in results:
+        result["direct"] = results["direct"]
+    if "tor" in results:
+        result["tor"] = results["tor"]
+        result["country"] = results["country"]
+        result["is_tor"] = True
+
+    return result
+
+
+def new_tor_circuit():
+    """Send NEWNYM signal to Tor control port."""
+    try:
+        with open(TOR_COOKIE, "rb") as f:
+            cookie = f.read()
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(10)
+        s.connect(("127.0.0.1", TOR_CONTROL_PORT))
+
+        hex_cookie = cookie.hex()
+        s.sendall(f"AUTHENTICATE {hex_cookie}\r\n".encode())
+        resp = s.recv(1024)
+        if "250" not in resp.decode(errors="ignore"):
+            s.close()
+            return False, "Auth failed"
+
+        s.sendall(b"SIGNAL NEWNYM\r\n")
+        resp = s.recv(1024)
+        s.close()
+
+        if "250" in resp.decode(errors="ignore"):
+            return True, "New circuit requested"
+        return False, f"Signal failed: {resp.decode(errors='ignore')}"
+    except Exception as e:
+        return False, str(e)
+
+
+def set_exit_country(country_code):
+    """Set ExitNodes in torrc and reload Tor."""
+    try:
+        with open(TORRC, "r") as f:
+            lines = f.readlines()
+    except: lines = []
+
+    new_lines = []
+    for line in lines:
+        if line.strip().startswith("ExitNodes") or line.strip().startswith("StrictExitNodes"):
+            continue
+        new_lines.append(line)
+
+    while new_lines and new_lines[-1].strip() == "":
+        new_lines = new_lines[:-1]
+
+    if country_code:
+        new_lines.append(f"\n# Set by Tor App Manager\n")
+        new_lines.append(f"ExitNodes {{{country_code}}}\n")
+        new_lines.append("StrictExitNodes 1\n")
+    else:
+        new_lines.append(f"\n# ExitNodes cleared by Tor App Manager\n")
+
+    with open(TORRC, "w") as f:
+        f.writelines(new_lines)
+
+    r = subprocess.run(["sudo", "systemctl", "reload", "tor"],
+                       capture_output=True, text=True, timeout=10)
+    return r.returncode == 0, r.stdout + r.stderr
+
+
+def get_current_exit_country():
+    """Read current ExitNodes from torrc."""
+    try:
+        with open(TORRC, "r") as f:
+            for line in f:
+                m = re.search(r"ExitNodes\s*\{(\w+)\}", line)
+                if m:
+                    return m.group(1).lower()
+    except: pass
+    return ""
+
+
+def measure_tor_latency():
+    """Measure latency through Tor — PARALLEL, fast timeout."""
+    import time
+    times = [None, None, None]
+
+    def _ping(idx):
+        try:
+            r = subprocess.run(
+                ["curl", "-4", "--connect-timeout", "5", "--max-time", "8", "-s", "-o", "/dev/null",
+                 "-w", "%{time_total}", "--socks5-hostname", "127.0.0.1:9050",
+                 "https://check.torproject.org/"],
+                capture_output=True, text=True, timeout=10
+            )
+            if r.stdout.strip():
+                times[idx] = float(r.stdout.strip())
+        except: pass
+
+    threads = [threading.Thread(target=_ping, args=(i,), daemon=True) for i in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=12)
+
+    valid = [t for t in times if t is not None]
+    if valid:
+        avg = sum(valid) / len(valid)
+        return avg * 1000, f"{avg*1000:.0f} ms ({len(valid)}/3)"
+    return 0, "timeout"
+
+
+# ── UI ───────────────────────────────────────────────────────────────────
+
+class TorManagerWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Tor App Manager")
+        self.setMinimumSize(520, 600)
+        self.setMaximumWidth(560)
+
+        self.tor_active = False
+        self.proxy_active = False
+        self.ips = {"direct": "?", "tor": "?", "is_tor": False, "country": "?"}
+
+        icon_path = "/usr/local/share/icons/tor-app-manager-64.png"
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
+
+        self._setup_ui()
+        self._setup_tray()
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._refresh_status)
+        self.timer.start(5000)
+
+        QTimer.singleShot(200, self._refresh_status)
+        QTimer.singleShot(500, self._refresh_ips)
+
+    def _setup_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+        layout.setSpacing(12)
+
+        self._build_status_card(layout)
+        self._build_toggle_section(layout)
+        self._build_country_section(layout)
+        self._build_actions_section(layout)
+        self._build_ip_card(layout)
+
+        layout.addStretch()
+
+    def _card(self, title, parent_layout):
+        gb = QGroupBox(title)
+        gb.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold; font-size: 12px;
+                border: 1px solid #555; border-radius: 6px;
+                margin-top: 8px; padding-top: 14px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px; padding: 0 6px;
+            }
+        """)
+        layout = QVBoxLayout(gb)
+        layout.setSpacing(6)
+        parent_layout.addWidget(gb)
+        return layout
+
+    def _build_status_card(self, parent):
+        layout = self._card("Status", parent)
+        row = QHBoxLayout()
+        self.status_icon = QLabel("⬤")
+        self.status_icon.setStyleSheet("font-size: 24px; color: #95a5a6;")
+        row.addWidget(self.status_icon)
+        col = QVBoxLayout()
+        self.status_text = QLabel("Initializing...")
+        self.status_text.setFont(QFont("sans-serif", 11))
+        self.status_detail = QLabel("")
+        self.status_detail.setStyleSheet("color: #888; font-size: 10px;")
+        col.addWidget(self.status_text)
+        col.addWidget(self.status_detail)
+        row.addLayout(col, 1)
+        layout.addLayout(row)
+
+    def _build_toggle_section(self, parent):
+        layout = self._card("Control", parent)
+        row = QHBoxLayout()
+
+        self.toggle_btn = QPushButton("START TRANSPARENT PROXY")
+        self.toggle_btn.setStyleSheet("""
+            QPushButton {
+                font-size: 13px; font-weight: bold; padding: 10px 20px;
+                border-radius: 6px; background: #27ae60; color: white;
+            }
+            QPushButton:hover { background: #2ecc71; }
+            QPushButton:disabled { background: #555; }
+        """)
+        self.toggle_btn.setMinimumHeight(44)
+        self.toggle_btn.clicked.connect(self._toggle_proxy)
+        row.addWidget(self.toggle_btn, 1)
+
+        self.rotate_btn = QPushButton("🔄 New IP")
+        self.rotate_btn.setStyleSheet("""
+            QPushButton {
+                font-size: 12px; padding: 10px 14px;
+                border-radius: 6px; background: #2980b9; color: white;
+            }
+            QPushButton:hover { background: #3498db; }
+            QPushButton:disabled { background: #555; }
+        """)
+        self.rotate_btn.setMinimumHeight(44)
+        self.rotate_btn.clicked.connect(self._rotate_ip)
+        row.addWidget(self.rotate_btn)
+
+        layout.addLayout(row)
+
+    def _build_country_section(self, parent):
+        layout = self._card("Exit Node Country", parent)
+        row = QHBoxLayout()
+
+        self.country_combo = QComboBox()
+        self.country_combo.setMinimumWidth(200)
+        codes = sorted(COUNTRIES.keys())
+        for code in codes:
+            if code == "":
+                self.country_combo.addItem(COUNTRIES[code], "")
+            else:
+                self.country_combo.addItem(COUNTRIES[code], code)
+
+        self.country_combo.currentIndexChanged.connect(self._on_country_change)
+        row.addWidget(self.country_combo, 1)
+
+        self.apply_country_btn = QPushButton("Apply")
+        self.apply_country_btn.setStyleSheet("""
+            QPushButton {
+                padding: 6px 16px; border-radius: 4px;
+                background: #8e44ad; color: white; font-weight: bold;
+            }
+            QPushButton:hover { background: #9b59b6; }
+        """)
+        self.apply_country_btn.clicked.connect(self._apply_country)
+        row.addWidget(self.apply_country_btn)
+
+        layout.addLayout(row)
+
+        self.country_status = QLabel("")
+        self.country_status.setStyleSheet("color: #888; font-size: 10px;")
+        layout.addWidget(self.country_status)
+
+    def _build_actions_section(self, parent):
+        layout = self._card("Tools", parent)
+        row = QHBoxLayout()
+
+        self.ping_btn = QPushButton("📡 Test Latency")
+        self.ping_btn.clicked.connect(self._test_latency)
+        self.ping_btn.setStyleSheet("QPushButton { padding: 8px 16px; border-radius: 4px; }")
+        row.addWidget(self.ping_btn)
+
+        self.copy_ip_btn = QPushButton("📋 Copy Tor IP")
+        self.copy_ip_btn.clicked.connect(self._copy_tor_ip)
+        self.copy_ip_btn.setStyleSheet("QPushButton { padding: 8px 16px; border-radius: 4px; }")
+        row.addWidget(self.copy_ip_btn)
+
+        self.refresh_status_btn = QPushButton("🔄 Refresh")
+        self.refresh_status_btn.clicked.connect(self._refresh_all)
+        self.refresh_status_btn.setStyleSheet("QPushButton { padding: 8px 16px; border-radius: 4px; }")
+        row.addWidget(self.refresh_status_btn)
+
+        layout.addLayout(row)
+
+        self.tool_output = QLabel("")
+        self.tool_output.setStyleSheet("color: #aaa; font-size: 10px; padding: 2px;")
+        layout.addWidget(self.tool_output)
+
+    def _build_ip_card(self, parent):
+        layout = self._card("IP Information", parent)
+        grid = QGridLayout()
+        grid.setSpacing(4)
+
+        grid.addWidget(QLabel("Direct IP:"), 0, 0)
+        self.direct_ip_label = QLabel("...")
+        self.direct_ip_label.setFont(QFont("monospace", 11))
+        grid.addWidget(self.direct_ip_label, 0, 1)
+
+        grid.addWidget(QLabel("Tor Exit IP:"), 1, 0)
+        self.tor_ip_label = QLabel("...")
+        self.tor_ip_label.setFont(QFont("monospace", 11, QFont.Bold))
+        grid.addWidget(self.tor_ip_label, 1, 1)
+
+        grid.addWidget(QLabel("Exit Country:"), 2, 0)
+        self.exit_country_label = QLabel("...")
+        self.exit_country_label.setFont(QFont("monospace", 11))
+        grid.addWidget(self.exit_country_label, 2, 1)
+
+        grid.addWidget(QLabel("Tor:"), 3, 0)
+        self.tor_check_label = QLabel("...")
+        self.tor_check_label.setFont(QFont("monospace", 11, QFont.Bold))
+        grid.addWidget(self.tor_check_label, 3, 1)
+
+        layout.addLayout(grid)
+
+    def _setup_tray(self):
+        self.tray_icon = QSystemTrayIcon(self._make_icon("#95a5a6"), self)
+        self.tray_icon.setToolTip("Tor App Manager")
+
+        tray_menu = QMenu()
+        self.tray_status = tray_menu.addAction("Status: ...")
+        self.tray_status.setEnabled(False)
+        self.tray_toggle = tray_menu.addAction("Toggle Proxy")
+        self.tray_toggle.triggered.connect(self._toggle_proxy)
+        self.tray_rotate = tray_menu.addAction("New IP (NEWNYM)")
+        self.tray_rotate.triggered.connect(self._rotate_ip)
+        tray_menu.addSeparator()
+        show_action = tray_menu.addAction("Show Window")
+        show_action.triggered.connect(self.show_normal)
+        tray_menu.addSeparator()
+        self.tray_ip = tray_menu.addAction("Tor IP: ...")
+        self.tray_ip.setEnabled(False)
+        tray_menu.addSeparator()
+        quit_action = tray_menu.addAction("Quit")
+        quit_action.triggered.connect(self._quit)
+
+        self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.activated.connect(self._tray_click)
+        self.tray_icon.show()
+
+    def _make_icon(self, color_hex):
+        size = 64
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setBrush(QColor(color_hex))
+        painter.setPen(Qt.NoPen)
+        painter.drawEllipse(4, 4, size - 8, size - 8)
+        painter.setPen(QColor("white"))
+        font = QFont("sans-serif", 28, QFont.Bold)
+        painter.setFont(font)
+        painter.drawText(pixmap.rect(), Qt.AlignCenter, "T")
+        painter.end()
+        return QIcon(pixmap)
+
+    def _tray_click(self, reason):
+        if reason == QSystemTrayIcon.DoubleClick:
+            self.show_normal()
+
+    def show_normal(self):
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self._refresh_all()
+
+    def closeEvent(self, event):
+        event.ignore()
+        self.hide()
+        self.tray_icon.showMessage(
+            "Tor App Manager",
+            "Minimized to tray. Double-click to reopen.",
+            QSystemTrayIcon.Information, 2000
+        )
+
+    def _toggle_proxy(self):
+        if not self.tor_active:
+            self.tool_output.setText("Tor is not running. Start Tor first.")
+            return
+
+        turning_on = not self.proxy_active
+        self.toggle_btn.setEnabled(False)
+        self.toggle_btn.setText("STOPPING..." if turning_on else "STARTING...")
+        self.tool_output.setText("Working...")
+
+        def _do():
+            action = "start" if turning_on else "stop"
+            rc, out, err = run_script(action)
+            QTimer.singleShot(0, self._refresh_all)
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _apply_country(self):
+        code = self.country_combo.currentData()
+        self.apply_country_btn.setEnabled(False)
+        self.country_status.setText("Applying...")
+
+        def _do():
+            ok, msg = set_exit_country(code)
+            QTimer.singleShot(0, lambda: self._country_result(ok, msg))
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _country_result(self, ok, msg):
+        self.apply_country_btn.setEnabled(True)
+        if ok:
+            code = self.country_combo.currentData()
+            name = COUNTRIES.get(code, "Random")
+            self.country_status.setText(f"✔ ExitNodes set to {name}")
+            QTimer.singleShot(2000, self._refresh_ips)
+        else:
+            self.country_status.setText(f"✖ Failed: {msg[:50]}")
+
+    def _on_country_change(self):
+        code = self.country_combo.currentData()
+        self._apply_country()
+
+    def _rotate_ip(self):
+        self.rotate_btn.setEnabled(False)
+        self.rotate_btn.setText("🌀 Rotating...")
+        self.tool_output.setText("Requesting new circuit...")
+
+        def _do():
+            ok, msg = new_tor_circuit()
+            QTimer.singleShot(0, lambda: self._rotate_result(ok, msg))
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _rotate_result(self, ok, msg):
+        self.rotate_btn.setEnabled(True)
+        self.rotate_btn.setText("🔄 New IP")
+        if ok:
+            self.tool_output.setText("✔ New circuit established. Waiting for new IP...")
+            QTimer.singleShot(3000, self._refresh_ips)
+        else:
+            self.tool_output.setText(f"✖ {msg}")
+
+    def _test_latency(self):
+        self.ping_btn.setEnabled(False)
+        self.ping_btn.setText("⏳ Testing...")
+        self.tool_output.setText("Measuring Tor latency (parallel)...")
+
+        def _do():
+            ms, text = measure_tor_latency()
+            QTimer.singleShot(0, lambda: self._latency_result(ms, text))
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _latency_result(self, ms, text):
+        self.ping_btn.setEnabled(True)
+        self.ping_btn.setText("📡 Test Latency")
+        if ms:
+            color = "green" if ms < 2000 else ("orange" if ms < 5000 else "red")
+            self.tool_output.setText(
+                f"Tor latency: <span style='color:{color}; font-weight:bold;'>{text}</span>"
+            )
+        else:
+            self.tool_output.setText("✖ Latency test failed (Tor not running?)")
+
+    def _copy_tor_ip(self):
+        ip = self.ips["tor"]
+        if ip and ip != "?":
+            cb = QApplication.clipboard()
+            cb.setText(ip)
+            self.tool_output.setText(f"✔ Copied: {ip}")
+        else:
+            self.tool_output.setText("✖ No Tor IP available")
+
+    def _refresh_status(self):
+        def _do():
+            tor, proxy = get_tor_status()
+            self.tor_active = tor
+            self.proxy_active = proxy
+            QTimer.singleShot(0, self._update_ui)
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _refresh_ips(self):
+        def _do():
+            ips = get_public_ips()
+            self.ips = ips
+            QTimer.singleShot(0, self._update_ip_ui)
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _refresh_all(self):
+        self._refresh_status()
+        QTimer.singleShot(100, self._refresh_ips)
+
+    def _update_ui(self):
+        if self.proxy_active:
+            self.status_icon.setStyleSheet("font-size: 24px; color: #2ecc71;")
+            self.status_icon.setText("⬤")
+            self.status_text.setText("ACTIVE — All traffic through Tor")
+            self.status_detail.setText("Transparent proxy engaged")
+            self.toggle_btn.setText("STOP TRANSPARENT PROXY")
+            self.toggle_btn.setStyleSheet("""
+                QPushButton {
+                    font-size: 13px; font-weight: bold; padding: 10px 20px;
+                    border-radius: 6px; background: #e74c3c; color: white;
+                }
+                QPushButton:hover { background: #c0392b; }
+                QPushButton:disabled { background: #555; }
+            """)
+            icon_color = "#2ecc71"
+        elif self.tor_active:
+            self.status_icon.setStyleSheet("font-size: 24px; color: #f39c12;")
+            self.status_icon.setText("◐")
+            self.status_text.setText("Tor running — Proxy OFF")
+            self.status_detail.setText("Click START to enable transparent proxy")
+            self.toggle_btn.setText("START TRANSPARENT PROXY")
+            self.toggle_btn.setStyleSheet("""
+                QPushButton {
+                    font-size: 13px; font-weight: bold; padding: 10px 20px;
+                    border-radius: 6px; background: #27ae60; color: white;
+                }
+                QPushButton:hover { background: #2ecc71; }
+                QPushButton:disabled { background: #555; }
+            """)
+            icon_color = "#f39c12"
+        else:
+            self.status_icon.setStyleSheet("font-size: 24px; color: #e74c3c;")
+            self.status_icon.setText("⛔")
+            self.status_text.setText("Tor NOT running")
+            self.status_detail.setText("Run 'sudo systemctl start tor' first")
+            self.toggle_btn.setText("START TRANSPARENT PROXY")
+            self.toggle_btn.setStyleSheet("""
+                QPushButton {
+                    font-size: 13px; font-weight: bold; padding: 10px 20px;
+                    border-radius: 6px; background: #555; color: #999;
+                }
+            """)
+            icon_color = "#e74c3c"
+
+        self.toggle_btn.setEnabled(self.tor_active)
+        self.tray_icon.setIcon(self._make_icon(icon_color))
+        self.tray_toggle.setText("Stop Proxy" if self.proxy_active else "Start Proxy")
+
+    def _update_ip_ui(self):
+        ips = self.ips
+        self.direct_ip_label.setText(ips["direct"] or "blocked")
+        self.tor_ip_label.setText(ips["tor"] or "N/A")
+
+        country = ips.get("country", "?")
+        for code, name in COUNTRIES.items():
+            if code and code.upper() == country:
+                self.exit_country_label.setText(name)
+                break
+        else:
+            self.exit_country_label.setText(country)
+
+        if ips["is_tor"]:
+            self.tor_check_label.setText("✔ YES (traffic via Tor)")
+            self.tor_check_label.setStyleSheet("font-size: 11px; color: #2ecc71; font-weight: bold;")
+        else:
+            self.tor_check_label.setText("✖ NO")
+            self.tor_check_label.setStyleSheet("font-size: 11px; color: #e74c3c; font-weight: bold;")
+
+        if ips["tor"] and ips["tor"] != "?":
+            self.tray_ip.setText(f"Tor IP: {ips['tor']}")
+
+    def _quit(self):
+        # Stop transparent proxy on exit
+        try:
+            subprocess.run(["sudo", SCRIPT, "stop"], capture_output=True, timeout=15)
+        except: pass
+        self.tray_icon.hide()
+        self.close()
+        QApplication.quit()
+
+
+# ── Entry ────────────────────────────────────────────────────────────────
+
+def main():
+    app = QApplication(sys.argv)
+    app.setApplicationName("Tor App Manager")
+    app.setOrganizationName("tor-app-manager")
+    app.setQuitOnLastWindowClosed(False)
+
+    pal = QPalette()
+    pal.setColor(QPalette.Window, QColor(30, 30, 30))
+    pal.setColor(QPalette.WindowText, QColor(220, 220, 220))
+    pal.setColor(QPalette.Base, QColor(25, 25, 25))
+    pal.setColor(QPalette.Text, QColor(220, 220, 220))
+    pal.setColor(QPalette.Button, QColor(45, 45, 45))
+    pal.setColor(QPalette.ButtonText, QColor(220, 220, 220))
+    pal.setColor(QPalette.Highlight, QColor(52, 152, 219))
+    pal.setColor(QPalette.HighlightedText, QColor(255, 255, 255))
+    app.setPalette(pal)
+
+    app.setStyleSheet("""
+        QToolTip { background: #333; color: #eee; border: 1px solid #555; }
+        QComboBox {
+            background: #333; color: #ddd; border: 1px solid #555;
+            padding: 4px 8px; border-radius: 4px;
+        }
+        QComboBox::drop-down { border: none; }
+        QComboBox QAbstractItemView {
+            background: #333; color: #ddd; selection-background-color: #2980b9;
+        }
+        QGroupBox { color: #ddd; }
+        QLabel { color: #ccc; }
+    """)
+
+    w = TorManagerWindow()
+    w.show()
+
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()

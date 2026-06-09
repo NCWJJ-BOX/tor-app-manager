@@ -1,0 +1,164 @@
+#!/bin/bash
+# tor-app-manager - Tor App Manager backend (transparent Tor proxy controller)
+# Usage: tor-app-manager {start|stop|restart|status|ip}
+
+TOR_USER="debian-tor"
+TRANS_PORT="9040"
+DNS_PORT="5353"
+SOCKS_PORT="9050"
+
+RESERVED_NETS=(
+    "0.0.0.0/8"
+    "10.0.0.0/8"
+    "127.0.0.0/8"
+    "169.254.0.0/16"
+    "172.16.0.0/12"
+    "192.168.0.0/16"
+    "224.0.0.0/4"
+    "240.0.0.0/4"
+)
+
+DOCKER_RUNNING=false
+
+save_docker_state() {
+    if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+        DOCKER_RUNNING=true
+    fi
+}
+
+restore_docker() {
+    if [ "$DOCKER_RUNNING" = true ]; then
+        echo "[*] Restoring Docker networking..."
+        systemctl restart docker >/dev/null 2>&1 || true
+        sleep 1
+    fi
+}
+
+get_tor_uid() {
+    id -u "$TOR_USER" 2>/dev/null || echo -1
+}
+
+start_transparent() {
+    echo "[*] Starting transparent Tor proxy..."
+
+    if ! systemctl is-active --quiet tor; then
+        echo "[*] Starting Tor service..."
+        systemctl start tor
+        sleep 3
+    fi
+
+    TOR_UID=$(get_tor_uid)
+    if [ "$TOR_UID" = "-1" ]; then
+        echo "[-] Tor user 'debian-tor' not found!"
+        exit 1
+    fi
+
+    save_docker_state
+
+    # Flush our filter rules (not nat/mangle — Docker owns PREROUTING)
+    iptables -F OUTPUT 2>/dev/null
+
+    # ── NAT table ──
+    iptables -t nat -F OUTPUT 2>/dev/null
+
+    iptables -t nat -A OUTPUT -p tcp --dport "$TRANS_PORT" -j RETURN
+    iptables -t nat -A OUTPUT -p udp --dport "$DNS_PORT" -j RETURN
+    iptables -t nat -A OUTPUT -p tcp --dport "$DNS_PORT" -j RETURN
+    iptables -t nat -A OUTPUT -m owner --uid-owner "$TOR_UID" -j RETURN
+
+    for net in "${RESERVED_NETS[@]}"; do
+        iptables -t nat -A OUTPUT -d "$net" -j RETURN
+    done
+
+    iptables -t nat -A OUTPUT -p udp --dport 53 -j REDIRECT --to-ports "$DNS_PORT"
+    iptables -t nat -A OUTPUT -p tcp --dport 53 -j REDIRECT --to-ports "$DNS_PORT"
+    iptables -t nat -A OUTPUT -p tcp --syn -j REDIRECT --to-ports "$TRANS_PORT"
+
+    # ── Mangle table: fix MSS ──
+    iptables -t mangle -F OUTPUT 2>/dev/null
+    iptables -t mangle -A OUTPUT -p tcp --dport "$TRANS_PORT" -j ACCEPT
+    iptables -t mangle -A OUTPUT -p tcp ! --dport "$TRANS_PORT" -j TCPMSS --clamp-mss-to-pmtu
+
+    # ── Filter table: killswitch ──
+    iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    iptables -A OUTPUT -m owner --uid-owner "$TOR_UID" -j ACCEPT
+
+    for net in "${RESERVED_NETS[@]}"; do
+        iptables -A OUTPUT -d "$net" -j ACCEPT
+    done
+
+    # Allow redirected traffic to Tor ports (127.0.0.1 after REDIRECT)
+    iptables -A OUTPUT -d 127.0.0.0/8 -p tcp --dport "$TRANS_PORT" -j ACCEPT
+    iptables -A OUTPUT -d 127.0.0.0/8 -p udp --dport "$DNS_PORT" -j ACCEPT
+    iptables -A OUTPUT -d 127.0.0.0/8 -p tcp --dport "$DNS_PORT" -j ACCEPT
+
+    # Allow all loopback (needed for internal comms)
+    iptables -A OUTPUT -o lo -j ACCEPT
+
+    # Block DNS leaks
+    iptables -A OUTPUT -p udp --dport 53 -j DROP
+    iptables -A OUTPUT -p tcp --dport 53 -j DROP
+
+    # Killswitch
+    iptables -A OUTPUT -j DROP
+
+    echo "[+] Transparent Tor proxy ACTIVE"
+}
+
+stop_transparent() {
+    echo "[*] Stopping transparent Tor proxy..."
+
+    iptables -t nat -F OUTPUT 2>/dev/null
+    iptables -t mangle -F OUTPUT 2>/dev/null
+    iptables -F OUTPUT 2>/dev/null
+    iptables -P INPUT ACCEPT 2>/dev/null
+    iptables -P FORWARD ACCEPT 2>/dev/null
+    iptables -P OUTPUT ACCEPT 2>/dev/null
+
+    restore_docker
+
+    echo "[+] Transparent Tor proxy STOPPED"
+}
+
+status_transparent() {
+    echo "=== Tor Service ==="
+    systemctl is-active --quiet tor && echo "  Tor: RUNNING" || echo "  Tor: STOPPED"
+
+    echo "=== IPTables Rules ==="
+    local nat_rules
+    nat_rules=$(iptables -t nat -L OUTPUT -n 2>/dev/null | grep -c "REDIRECT")
+    if [ "$nat_rules" -gt 0 ]; then
+        echo "  Transparent Proxy: ACTIVE"
+    else
+        echo "  Transparent Proxy: INACTIVE"
+    fi
+
+    echo "=== Current IP ==="
+    local direct_ip
+    direct_ip=$(curl -4 --connect-timeout 5 -s https://ifconfig.me 2>/dev/null || echo "timeout/blocked")
+    echo "  Direct IP: $direct_ip"
+
+    local tor_ip
+    tor_ip=$(curl -4 --connect-timeout 5 -s --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('IP','unknown'))" 2>/dev/null || echo "timeout")
+    echo "  Tor Exit IP: $tor_ip"
+}
+
+check_ip() {
+    echo "=== Current Public IP ==="
+    local direct
+    direct=$(curl -4 --connect-timeout 5 -s https://ifconfig.me 2>/dev/null || echo "BLOCKED")
+    echo "Direct : $direct"
+
+    local tor_exit
+    tor_exit=$(curl -4 --connect-timeout 5 -s --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('IP','unknown'))" 2>/dev/null || echo "timeout")
+    echo "Tor Exit: $tor_exit"
+}
+
+case "${1:-status}" in
+    start)   start_transparent ;;
+    stop)    stop_transparent ;;
+    restart) stop_transparent; sleep 1; start_transparent ;;
+    status)  status_transparent ;;
+    ip)      check_ip ;;
+    *)       echo "Usage: $0 {start|stop|restart|status|ip}"; exit 1 ;;
+esac

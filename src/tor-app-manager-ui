@@ -22,10 +22,27 @@ from PyQt5.QtWidgets import (
     QCheckBox, QSpinBox
 )
 from PyQt5.QtGui import (
-    QIcon, QFont, QColor, QPalette, QPainter, QPixmap, QCursor
+    QIcon, QFont, QColor, QPalette, QPainter, QPixmap, QCursor,
+    QPainterPath, QRadialGradient, QBrush, QPen
 )
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QSize
 
+
+# ── Design System ────────────────────────────────────────────────────────
+
+CLR = {
+    "bg":        "#0A0E0F",
+    "card":      "#141A1F",
+    "border":    "#1E2D3D",
+    "text":      "#F0F0F0",
+    "text_sec":  "#8899AA",
+    "text_muted":"#556677",
+    "primary":   "#0EA5E9",
+    "success":   "#10B981",
+    "warning":   "#F59E0B",
+    "danger":    "#EF4444",
+    "disabled":  "#4B5563",
+}
 
 # ── Constants ────────────────────────────────────────────────────────────
 
@@ -241,6 +258,71 @@ def measure_tor_latency():
     return 0, "timeout"
 
 
+# ── Custom Widgets ───────────────────────────────────────────────────────
+
+class StatusDot(QWidget):
+    """Animated status indicator — drawn with QPainter, no emoji."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._color = QColor(CLR["disabled"])
+        self._pulse = 1.0
+        self._dir = -1
+        self._animating = False
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self.setFixedSize(28, 28)
+
+    def set_color(self, color_hex, animate=False):
+        self._color = QColor(color_hex)
+        if animate and not self._animating:
+            self._animating = True
+            self._timer.start(40)
+        elif not animate:
+            self._animating = False
+            self._timer.stop()
+            self._pulse = 1.0
+        self.update()
+
+    def _tick(self):
+        self._pulse += 0.04 * self._dir
+        if self._pulse <= 0.6:
+            self._dir = 1
+        elif self._pulse >= 1.0:
+            self._dir = -1
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        rect = self.rect().adjusted(3, 3, -3, -3)
+        r = rect.width() // 2
+        center = rect.center()
+
+        # glow ring
+        glow_r = r * (1.5 + (1.0 - self._pulse) * 0.7) if self._animating else r * 1.3
+        grad = QRadialGradient(center, glow_r)
+        c = QColor(self._color)
+        c.setAlpha(int(50 * self._pulse))
+        grad.setColorAt(0, c)
+        grad.setColorAt(0.4, c)
+        grad.setColorAt(1, QColor(0, 0, 0, 0))
+        p.setBrush(QBrush(grad))
+        p.setPen(Qt.NoPen)
+        p.drawEllipse(center, glow_r, glow_r)
+
+        # core dot
+        p.setBrush(self._color)
+        p.setPen(QPen(self._color.lighter(140), 1))
+        p.drawEllipse(center, r * self._pulse, r * self._pulse)
+
+        # inner highlight
+        if self._animating:
+            hl = QColor(255, 255, 255, int(40 + (1.0 - self._pulse) * 40))
+            p.setBrush(hl)
+            p.setPen(Qt.NoPen)
+            p.drawEllipse(center, r * 0.35, r * 0.35)
+
+
 # ── UI ───────────────────────────────────────────────────────────────────
 
 class TorManagerWindow(QMainWindow):
@@ -284,34 +366,35 @@ class TorManagerWindow(QMainWindow):
 
     def _card(self, title, parent_layout):
         gb = QGroupBox(title)
-        gb.setStyleSheet("""
-            QGroupBox {
+        gb.setStyleSheet(f"""
+            QGroupBox {{
                 font-weight: bold; font-size: 12px;
-                border: 1px solid #555; border-radius: 6px;
-                margin-top: 8px; padding-top: 14px;
-            }
-            QGroupBox::title {
+                border: 1px solid {CLR['border']}; border-radius: 8px;
+                margin-top: 10px; padding-top: 16px; padding-bottom: 6px;
+                background: {CLR['card']};
+            }}
+            QGroupBox::title {{
                 subcontrol-origin: margin;
                 left: 10px; padding: 0 6px;
-            }
+                color: {CLR['text_sec']};
+            }}
         """)
         layout = QVBoxLayout(gb)
-        layout.setSpacing(6)
+        layout.setSpacing(8)
         parent_layout.addWidget(gb)
         return layout
 
     def _build_status_card(self, parent):
         layout = self._card("Status", parent)
         row = QHBoxLayout()
-        self.status_icon = QLabel("⬤")
-        self.status_icon.setStyleSheet("font-size: 24px; color: #95a5a6;")
-        row.addWidget(self.status_icon)
+        self.status_dot = StatusDot()
+        row.addWidget(self.status_dot)
         col = QVBoxLayout()
         self.status_text = QLabel("Initializing...")
         self.status_text.setFont(QFont("sans-serif", 11))
-        self.status_detail = QLabel("")
-        self.status_detail.setStyleSheet("color: #888; font-size: 10px;")
         col.addWidget(self.status_text)
+        self.status_detail = QLabel("")
+        self.status_detail.setStyleSheet(f"color: {CLR['text_muted']}; font-size: 10px;")
         col.addWidget(self.status_detail)
         row.addLayout(col, 1)
         layout.addLayout(row)
@@ -321,26 +404,30 @@ class TorManagerWindow(QMainWindow):
         row = QHBoxLayout()
 
         self.toggle_btn = QPushButton("START TRANSPARENT PROXY")
-        self.toggle_btn.setStyleSheet("""
-            QPushButton {
-                font-size: 13px; font-weight: bold; padding: 10px 20px;
-                border-radius: 6px; background: #27ae60; color: white;
-            }
-            QPushButton:hover { background: #2ecc71; }
-            QPushButton:disabled { background: #555; }
+        self.toggle_btn.setStyleSheet(f"""
+            QPushButton {{
+                font-size: 13px; font-weight: bold; padding: 11px 20px;
+                border-radius: 6px; background: {CLR['success']}; color: #fff; border: none;
+                min-height: 22px;
+            }}
+            QPushButton:hover {{ background: #34D399; }}
+            QPushButton:disabled {{ background: {CLR['disabled']}; color: #777; }}
+            QPushButton:focus {{ outline: 2px solid {CLR['primary']}; outline-offset: 2px; }}
         """)
         self.toggle_btn.setMinimumHeight(44)
         self.toggle_btn.clicked.connect(self._toggle_proxy)
         row.addWidget(self.toggle_btn, 1)
 
-        self.rotate_btn = QPushButton("🔄 New IP")
-        self.rotate_btn.setStyleSheet("""
-            QPushButton {
-                font-size: 12px; padding: 10px 14px;
-                border-radius: 6px; background: #2980b9; color: white;
-            }
-            QPushButton:hover { background: #3498db; }
-            QPushButton:disabled { background: #555; }
+        self.rotate_btn = QPushButton("Rotate IP")
+        self.rotate_btn.setStyleSheet(f"""
+            QPushButton {{
+                font-size: 12px; font-weight: bold; padding: 11px 14px;
+                border-radius: 6px; background: {CLR['primary']}; color: #fff; border: none;
+                min-height: 22px;
+            }}
+            QPushButton:hover {{ background: #38BDF8; }}
+            QPushButton:disabled {{ background: {CLR['disabled']}; color: #777; }}
+            QPushButton:focus {{ outline: 2px solid {CLR['primary']}; outline-offset: 2px; }}
         """)
         self.rotate_btn.setMinimumHeight(44)
         self.rotate_btn.clicked.connect(self._rotate_ip)
@@ -365,12 +452,14 @@ class TorManagerWindow(QMainWindow):
         row.addWidget(self.country_combo, 1)
 
         self.apply_country_btn = QPushButton("Apply")
-        self.apply_country_btn.setStyleSheet("""
-            QPushButton {
-                padding: 6px 16px; border-radius: 4px;
-                background: #8e44ad; color: white; font-weight: bold;
-            }
-            QPushButton:hover { background: #9b59b6; }
+        self.apply_country_btn.setStyleSheet(f"""
+            QPushButton {{
+                padding: 9px 16px; border-radius: 6px; border: none;
+                background: #6366F1; color: #fff; font-weight: bold; min-height: 20px;
+            }}
+            QPushButton:hover {{ background: #818CF8; }}
+            QPushButton:disabled {{ background: {CLR['disabled']}; color: #777; }}
+            QPushButton:focus {{ outline: 2px solid {CLR['primary']}; outline-offset: 2px; }}
         """)
         self.apply_country_btn.clicked.connect(self._apply_country)
         row.addWidget(self.apply_country_btn)
@@ -385,19 +474,31 @@ class TorManagerWindow(QMainWindow):
         layout = self._card("Tools", parent)
         row = QHBoxLayout()
 
-        self.ping_btn = QPushButton("📡 Test Latency")
+        self.ping_btn = QPushButton("Test Latency")
         self.ping_btn.clicked.connect(self._test_latency)
-        self.ping_btn.setStyleSheet("QPushButton { padding: 8px 16px; border-radius: 4px; }")
+        self.ping_btn.setStyleSheet(f"""
+            QPushButton {{ padding: 8px 16px; border-radius: 4px; background: {CLR['card']}; color: {CLR['text']}; border: 1px solid {CLR['border']}; }}
+            QPushButton:hover {{ border-color: {CLR['primary']}; }}
+            QPushButton:focus {{ outline: 2px solid {CLR['primary']}; outline-offset: 2px; }}
+        """)
         row.addWidget(self.ping_btn)
 
-        self.copy_ip_btn = QPushButton("📋 Copy Tor IP")
+        self.copy_ip_btn = QPushButton("Copy Tor IP")
         self.copy_ip_btn.clicked.connect(self._copy_tor_ip)
-        self.copy_ip_btn.setStyleSheet("QPushButton { padding: 8px 16px; border-radius: 4px; }")
+        self.copy_ip_btn.setStyleSheet(f"""
+            QPushButton {{ padding: 8px 16px; border-radius: 4px; background: {CLR['card']}; color: {CLR['text']}; border: 1px solid {CLR['border']}; }}
+            QPushButton:hover {{ border-color: {CLR['primary']}; }}
+            QPushButton:focus {{ outline: 2px solid {CLR['primary']}; outline-offset: 2px; }}
+        """)
         row.addWidget(self.copy_ip_btn)
 
-        self.refresh_status_btn = QPushButton("🔄 Refresh")
+        self.refresh_status_btn = QPushButton("Refresh")
         self.refresh_status_btn.clicked.connect(self._refresh_all)
-        self.refresh_status_btn.setStyleSheet("QPushButton { padding: 8px 16px; border-radius: 4px; }")
+        self.refresh_status_btn.setStyleSheet(f"""
+            QPushButton {{ padding: 8px 16px; border-radius: 4px; background: {CLR['card']}; color: {CLR['text']}; border: 1px solid {CLR['border']}; }}
+            QPushButton:hover {{ border-color: {CLR['primary']}; }}
+            QPushButton:focus {{ outline: 2px solid {CLR['primary']}; outline-offset: 2px; }}
+        """)
         row.addWidget(self.refresh_status_btn)
 
         layout.addLayout(row)
@@ -464,13 +565,43 @@ class TorManagerWindow(QMainWindow):
         pixmap.fill(Qt.transparent)
         painter = QPainter(pixmap)
         painter.setRenderHint(QPainter.Antialiasing)
-        painter.setBrush(QColor(color_hex))
+
+        # Shield shape
+        c = QColor(color_hex)
+        path = QPainterPath()
+        m = 6  # margin
+        w = size - 2 * m
+        h = size - 2 * m
+        path.moveTo(m + w / 2, m)                    # top center
+        path.lineTo(m + w, m + h * 0.25)              # top right
+        path.lineTo(m + w, m + h * 0.55)              # mid right
+        path.cubicTo(m + w, m + h * 0.75, m + w * 0.75, m + h, m + w / 2, m + h)  # bottom curve
+        path.cubicTo(m + w * 0.25, m + h, m, m + h * 0.75, m, m + h * 0.55)        # bottom left curve
+        path.lineTo(m, m + h * 0.25)                  # top left
+        path.closeSubpath()
+
+        # Outer glow
+        glow = QColor(color_hex)
+        glow.setAlpha(40)
+        glow_path = QPainterPath()
+        glow_path.addEllipse(m - 2, m - 2, w + 4, h + 4)
+        painter.setBrush(glow)
         painter.setPen(Qt.NoPen)
-        painter.drawEllipse(4, 4, size - 8, size - 8)
-        painter.setPen(QColor("white"))
-        font = QFont("sans-serif", 28, QFont.Bold)
+        painter.drawPath(glow_path)
+
+        # Shield fill
+        fill = QColor(color_hex)
+        fill.setAlpha(60)
+        painter.setBrush(fill)
+        painter.setPen(QPen(c, 2))
+        painter.drawPath(path)
+
+        # "T" letter inside shield
+        painter.setPen(c.lighter(150))
+        font = QFont("sans-serif", 22, QFont.Bold)
         painter.setFont(font)
         painter.drawText(pixmap.rect(), Qt.AlignCenter, "T")
+
         painter.end()
         return QIcon(pixmap)
 
@@ -526,10 +657,10 @@ class TorManagerWindow(QMainWindow):
         if ok:
             code = self.country_combo.currentData()
             name = COUNTRIES.get(code, "Random")
-            self.country_status.setText(f"✔ ExitNodes set to {name}")
+            self.country_status.setText(f"ExitNodes set to {name}")
             QTimer.singleShot(2000, self._refresh_ips)
         else:
-            self.country_status.setText(f"✖ Failed: {msg[:50]}")
+            self.country_status.setText(f"Failed: {msg[:50]}")
 
     def _on_country_change(self):
         code = self.country_combo.currentData()
@@ -537,7 +668,7 @@ class TorManagerWindow(QMainWindow):
 
     def _rotate_ip(self):
         self.rotate_btn.setEnabled(False)
-        self.rotate_btn.setText("🌀 Rotating...")
+        self.rotate_btn.setText("Rotating...")
         self.tool_output.setText("Requesting new circuit...")
 
         def _do():
@@ -548,16 +679,16 @@ class TorManagerWindow(QMainWindow):
 
     def _rotate_result(self, ok, msg):
         self.rotate_btn.setEnabled(True)
-        self.rotate_btn.setText("🔄 New IP")
+        self.rotate_btn.setText("New IP")
         if ok:
-            self.tool_output.setText("✔ New circuit established. Waiting for new IP...")
+            self.tool_output.setText("New circuit established. Waiting for new IP...")
             QTimer.singleShot(3000, self._refresh_ips)
         else:
-            self.tool_output.setText(f"✖ {msg}")
+            self.tool_output.setText(f"{msg}")
 
     def _test_latency(self):
         self.ping_btn.setEnabled(False)
-        self.ping_btn.setText("⏳ Testing...")
+        self.ping_btn.setText("Testing...")
         self.tool_output.setText("Measuring Tor latency (parallel)...")
 
         def _do():
@@ -568,23 +699,23 @@ class TorManagerWindow(QMainWindow):
 
     def _latency_result(self, ms, text):
         self.ping_btn.setEnabled(True)
-        self.ping_btn.setText("📡 Test Latency")
+        self.ping_btn.setText("Test Latency")
         if ms:
             color = "green" if ms < 2000 else ("orange" if ms < 5000 else "red")
             self.tool_output.setText(
                 f"Tor latency: <span style='color:{color}; font-weight:bold;'>{text}</span>"
             )
         else:
-            self.tool_output.setText("✖ Latency test failed (Tor not running?)")
+            self.tool_output.setText("Latency test failed (Tor not running?)")
 
     def _copy_tor_ip(self):
         ip = self.ips["tor"]
         if ip and ip != "?":
             cb = QApplication.clipboard()
             cb.setText(ip)
-            self.tool_output.setText(f"✔ Copied: {ip}")
+            self.tool_output.setText(f"Copied: {ip}")
         else:
-            self.tool_output.setText("✖ No Tor IP available")
+            self.tool_output.setText("No Tor IP available")
 
     def _refresh_status(self):
         def _do():
@@ -607,48 +738,48 @@ class TorManagerWindow(QMainWindow):
 
     def _update_ui(self):
         if self.proxy_active:
-            self.status_icon.setStyleSheet("font-size: 24px; color: #2ecc71;")
-            self.status_icon.setText("⬤")
+            self.status_dot.set_color(CLR['success'], animate=True)
             self.status_text.setText("ACTIVE — All traffic through Tor")
             self.status_detail.setText("Transparent proxy engaged")
-            self.toggle_btn.setText("STOP TRANSPARENT PROXY")
-            self.toggle_btn.setStyleSheet("""
-                QPushButton {
+            self.toggle_btn.setText("Stop Proxy")
+            self.toggle_btn.setStyleSheet(f"""
+                QPushButton {{
                     font-size: 13px; font-weight: bold; padding: 10px 20px;
-                    border-radius: 6px; background: #e74c3c; color: white;
-                }
-                QPushButton:hover { background: #c0392b; }
-                QPushButton:disabled { background: #555; }
+                    border-radius: 6px; background: {CLR['danger']}; color: white;
+                }}
+                QPushButton:hover {{ background: #c0392b; }}
+                QPushButton:disabled {{ background: {CLR['disabled']}; color: #777; }}
+                QPushButton:focus {{ outline: 2px solid {CLR['primary']}; outline-offset: 2px; }}
             """)
-            icon_color = "#2ecc71"
+            icon_color = CLR['success']
         elif self.tor_active:
-            self.status_icon.setStyleSheet("font-size: 24px; color: #f39c12;")
-            self.status_icon.setText("◐")
+            self.status_dot.set_color(CLR['warning'], animate=True)
             self.status_text.setText("Tor running — Proxy OFF")
             self.status_detail.setText("Click START to enable transparent proxy")
-            self.toggle_btn.setText("START TRANSPARENT PROXY")
-            self.toggle_btn.setStyleSheet("""
-                QPushButton {
+            self.toggle_btn.setText("Start Proxy")
+            self.toggle_btn.setStyleSheet(f"""
+                QPushButton {{
                     font-size: 13px; font-weight: bold; padding: 10px 20px;
-                    border-radius: 6px; background: #27ae60; color: white;
-                }
-                QPushButton:hover { background: #2ecc71; }
-                QPushButton:disabled { background: #555; }
+                    border-radius: 6px; background: {CLR['success']}; color: white;
+                }}
+                QPushButton:hover {{ background: #10b981; }}
+                QPushButton:disabled {{ background: {CLR['disabled']}; color: #777; }}
+                QPushButton:focus {{ outline: 2px solid {CLR['primary']}; outline-offset: 2px; }}
             """)
-            icon_color = "#f39c12"
+            icon_color = CLR['warning']
         else:
-            self.status_icon.setStyleSheet("font-size: 24px; color: #e74c3c;")
-            self.status_icon.setText("⛔")
+            self.status_dot.set_color(CLR['danger'], animate=True)
             self.status_text.setText("Tor NOT running")
             self.status_detail.setText("Run 'sudo systemctl start tor' first")
-            self.toggle_btn.setText("START TRANSPARENT PROXY")
-            self.toggle_btn.setStyleSheet("""
-                QPushButton {
+            self.toggle_btn.setText("Start Proxy")
+            self.toggle_btn.setStyleSheet(f"""
+                QPushButton {{
                     font-size: 13px; font-weight: bold; padding: 10px 20px;
-                    border-radius: 6px; background: #555; color: #999;
-                }
+                    border-radius: 6px; background: {CLR['disabled']}; color: #777;
+                }}
+                QPushButton:focus {{ outline: 2px solid {CLR['primary']}; outline-offset: 2px; }}
             """)
-            icon_color = "#e74c3c"
+            icon_color = CLR['danger']
 
         self.toggle_btn.setEnabled(self.tor_active)
         self.tray_icon.setIcon(self._make_icon(icon_color))
@@ -668,11 +799,11 @@ class TorManagerWindow(QMainWindow):
             self.exit_country_label.setText(country)
 
         if ips["is_tor"]:
-            self.tor_check_label.setText("✔ YES (traffic via Tor)")
-            self.tor_check_label.setStyleSheet("font-size: 11px; color: #2ecc71; font-weight: bold;")
+            self.tor_check_label.setText("YES (traffic via Tor)")
+            self.tor_check_label.setStyleSheet(f"font-size: 11px; color: {CLR['success']}; font-weight: bold;")
         else:
-            self.tor_check_label.setText("✖ NO")
-            self.tor_check_label.setStyleSheet("font-size: 11px; color: #e74c3c; font-weight: bold;")
+            self.tor_check_label.setText("NO")
+            self.tor_check_label.setStyleSheet(f"font-size: 11px; color: {CLR['danger']}; font-weight: bold;")
 
         if ips["tor"] and ips["tor"] != "?":
             self.tray_ip.setText(f"Tor IP: {ips['tor']}")
@@ -696,28 +827,28 @@ def main():
     app.setQuitOnLastWindowClosed(False)
 
     pal = QPalette()
-    pal.setColor(QPalette.Window, QColor(30, 30, 30))
-    pal.setColor(QPalette.WindowText, QColor(220, 220, 220))
-    pal.setColor(QPalette.Base, QColor(25, 25, 25))
-    pal.setColor(QPalette.Text, QColor(220, 220, 220))
-    pal.setColor(QPalette.Button, QColor(45, 45, 45))
-    pal.setColor(QPalette.ButtonText, QColor(220, 220, 220))
-    pal.setColor(QPalette.Highlight, QColor(52, 152, 219))
-    pal.setColor(QPalette.HighlightedText, QColor(255, 255, 255))
+    pal.setColor(QPalette.Window, QColor(10, 14, 15))
+    pal.setColor(QPalette.WindowText, QColor(240, 240, 240))
+    pal.setColor(QPalette.Base, QColor(20, 26, 31))
+    pal.setColor(QPalette.Text, QColor(240, 240, 240))
+    pal.setColor(QPalette.Button, QColor(20, 26, 31))
+    pal.setColor(QPalette.ButtonText, QColor(240, 240, 240))
+    pal.setColor(QPalette.Highlight, QColor(14, 165, 233))
+    pal.setColor(QPalette.HighlightedText, QColor(240, 240, 240))
     app.setPalette(pal)
 
-    app.setStyleSheet("""
-        QToolTip { background: #333; color: #eee; border: 1px solid #555; }
-        QComboBox {
-            background: #333; color: #ddd; border: 1px solid #555;
+    app.setStyleSheet(f"""
+        QToolTip {{ background: {CLR['card']}; color: {CLR['text']}; border: 1px solid {CLR['border']}; }}
+        QComboBox {{
+            background: {CLR['card']}; color: {CLR['text']}; border: 1px solid {CLR['border']};
             padding: 4px 8px; border-radius: 4px;
-        }
-        QComboBox::drop-down { border: none; }
-        QComboBox QAbstractItemView {
-            background: #333; color: #ddd; selection-background-color: #2980b9;
-        }
-        QGroupBox { color: #ddd; }
-        QLabel { color: #ccc; }
+        }}
+        QComboBox::drop-down {{ border: none; }}
+        QComboBox QAbstractItemView {{
+            background: {CLR['card']}; color: {CLR['text']}; selection-background-color: {CLR['primary']};
+        }}
+        QGroupBox {{ color: {CLR['text']}; }}
+        QLabel {{ color: {CLR['text_sec']}; }}
     """)
 
     w = TorManagerWindow()

@@ -9,9 +9,9 @@ APP_DIR="/usr/share/applications"
 echo "[*] Installing Tor App Manager..."
 
 # Binaries
-sudo cp src/tor-app-manager-ui "$BIN_DIR/"
+sudo cp src/tor-app-manager-ui "$BIN_DIR/tor-app-manager-ui.py"
 sudo cp src/tor-app-manager "$BIN_DIR/"
-sudo chmod +x "$BIN_DIR/tor-app-manager-ui" "$BIN_DIR/tor-app-manager"
+sudo chmod +x "$BIN_DIR/tor-app-manager-ui.py" "$BIN_DIR/tor-app-manager"
 
 # Icons
 sudo cp icons/tor-app-manager*.png "$ICON_DIR/"
